@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PostgreSQL View</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar">
+        <section class="panel hero-panel">
+          <p class="eyebrow">Local ERD Explorer</p>
+          <h1>PostgreSQL View</h1>
+          <p class="hero-copy">
+            Kết nối trực tiếp vào PostgreSQL, đọc schema, bảng, cột và vẽ quan hệ foreign key ngay trên web local.
+          </p>
+        </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <h2>Kết nối</h2>
+            <span class="badge badge-outline">psql</span>
+          </div>
+
+          <form id="connection-form" class="connection-form" autocomplete="off">
+            <label>
+              <span>Host</span>
+              <input id="host" name="host" type="text" placeholder="127.0.0.1 hoặc để trống" />
+            </label>
+
+            <label>
+              <span>Port</span>
+              <input id="port" name="port" type="number" min="1" max="65535" placeholder="5432" value="5432" />
+            </label>
+
+            <label class="full-width">
+              <span>Database</span>
+              <input id="database" name="database" type="text" placeholder="postgres" required />
+            </label>
+
+            <label>
+              <span>User</span>
+              <input id="user" name="user" type="text" placeholder="postgres" />
+            </label>
+
+            <label>
+              <span>Password</span>
+              <input id="password" name="password" type="password" placeholder="••••••••" />
+            </label>
+
+            <label class="full-width">
+              <span>SSL mode</span>
+              <select id="sslmode" name="sslmode">
+                <option value="prefer">prefer</option>
+                <option value="disable">disable</option>
+                <option value="require">require</option>
+              </select>
+            </label>
+
+            <div class="form-actions full-width">
+              <button id="connect-button" class="primary-button" type="submit">
+                Đọc schema
+              </button>
+              <button id="clear-button" class="secondary-button" type="button">
+                Xóa form
+              </button>
+            </div>
+          </form>
+
+          <p class="hint">
+            Password chỉ dùng trong request hiện tại, không lưu vào trình duyệt.
+          </p>
+          <div id="status-message" class="status-message" role="status" aria-live="polite"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <h2>Tổng quan</h2>
+          </div>
+          <div id="stats" class="stats-grid">
+            <article class="stat-card">
+              <span class="stat-label">Database</span>
+              <strong class="stat-value">Chưa tải</strong>
+            </article>
+            <article class="stat-card">
+              <span class="stat-label">Tables</span>
+              <strong class="stat-value">0</strong>
+            </article>
+            <article class="stat-card">
+              <span class="stat-label">Relations</span>
+              <strong class="stat-value">0</strong>
+            </article>
+          </div>
+          <div id="schema-filters" class="chip-row"></div>
+        </section>
+
+        <section class="panel grow-panel">
+          <div class="panel-header">
+            <h2>Danh sách bảng</h2>
+          </div>
+
+          <label class="search-box">
+            <span class="visually-hidden">Tìm bảng hoặc cột</span>
+            <input id="search-input" type="search" placeholder="Tìm theo bảng, schema, cột..." />
+          </label>
+
+          <div id="table-list" class="table-list"></div>
+        </section>
+
+        <section class="panel inspector-panel">
+          <div class="panel-header">
+            <h2>Chi tiết</h2>
+          </div>
+          <div id="inspector" class="inspector"></div>
+        </section>
+      </aside>
+
+      <main class="workspace">
+        <section class="workspace-toolbar">
+          <div>
+            <p id="workspace-title" class="workspace-title">Sơ đồ schema</p>
+            <p id="workspace-meta" class="workspace-meta">Chưa có dữ liệu</p>
+          </div>
+
+          <div class="toolbar-actions">
+            <button id="fit-button" class="secondary-button" type="button">Fit</button>
+            <button id="reset-button" class="secondary-button" type="button">Reset</button>
+          </div>
+        </section>
+
+        <section id="graph-viewport" class="graph-viewport">
+          <div id="empty-state" class="empty-state">
+            <h2>Sẵn sàng đọc schema</h2>
+            <p>
+              Nhập thông tin PostgreSQL ở bên trái, sau đó bấm <strong>Đọc schema</strong> để dựng sơ đồ ERD local.
+            </p>
+          </div>
+
+          <div id="graph-stage" class="graph-stage">
+            <svg id="graph-edges" class="graph-edges"></svg>
+            <div id="graph-schemas" class="graph-schemas"></div>
+            <div id="graph-nodes" class="graph-nodes"></div>
+          </div>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>
