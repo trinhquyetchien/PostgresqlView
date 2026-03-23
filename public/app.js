@@ -2,12 +2,22 @@
 
 const STORAGE_KEY = "postgresql-view.connection";
 const CARD_WIDTH = 320;
-const CARD_HEADER_HEIGHT = 72;
+const CARD_HEADER_HEIGHT = 84;
 const COLUMN_HEIGHT = 30;
-const COLUMN_GAP = 96;
-const ROW_GAP = 32;
-const GROUP_LABEL_HEIGHT = 52;
-const GROUP_TOP_PADDING = 84;
+const CARD_BOTTOM_PADDING = 20;
+const STAGE_PADDING = 88;
+const GROUP_HEADER_HEIGHT = 70;
+const GROUP_FRAME_PADDING = 28;
+const GROUP_FRAME_EXTRA_BOTTOM = 30;
+const GROUP_GAP_X = 96;
+const GROUP_GAP_Y = 88;
+const GROUP_COLUMN_GAP = 64;
+const GROUP_ROW_GAP = 52;
+const TABLE_COLLISION_GAP = 24;
+const EDGE_GRID_SIZE = 36;
+const EDGE_CLEARANCE = 32;
+const EDGE_PORT_OFFSET = 56;
+const EDGE_CORNER_RADIUS = 12;
 
 const state = {
   schema: null,
@@ -17,6 +27,7 @@ const state = {
   visibleTableIds: new Set(),
   currentTables: [],
   currentRelationships: [],
+  manualTablePositions: new Map(),
   layout: {
     tables: new Map(),
     groups: [],
@@ -24,11 +35,14 @@ const state = {
     height: 0,
   },
   view: {
-    x: 64,
-    y: 64,
+    x: 72,
+    y: 72,
     scale: 1,
   },
   pan: null,
+  drag: null,
+  suppressClickUntil: 0,
+  dragFrameRequested: false,
 };
 
 const elements = {
@@ -49,7 +63,6 @@ const elements = {
   inspector: document.querySelector("#inspector"),
   workspaceTitle: document.querySelector("#workspace-title"),
   workspaceMeta: document.querySelector("#workspace-meta"),
-  fitButton: document.querySelector("#fit-button"),
   resetButton: document.querySelector("#reset-button"),
   viewport: document.querySelector("#graph-viewport"),
   stage: document.querySelector("#graph-stage"),
@@ -71,10 +84,10 @@ function bindEvents() {
   elements.form.addEventListener("submit", handleSubmit);
   elements.clearButton.addEventListener("click", handleClearForm);
   elements.searchInput.addEventListener("input", handleSearchInput);
-  elements.fitButton.addEventListener("click", fitToViewport);
-  elements.resetButton.addEventListener("click", resetViewport);
+  elements.resetButton.addEventListener("click", handleResetView);
   elements.tableList.addEventListener("click", handleTableListClick);
   elements.schemaFilters.addEventListener("click", handleSchemaFilterClick);
+  elements.nodes.addEventListener("pointerdown", handleCardPointerDown);
   elements.nodes.addEventListener("click", handleNodeClick);
   elements.viewport.addEventListener("pointerdown", handlePointerDown);
   window.addEventListener("pointermove", handlePointerMove);
@@ -83,7 +96,7 @@ function bindEvents() {
   elements.viewport.addEventListener("wheel", handleWheel, { passive: false });
   window.addEventListener("resize", () => {
     if (state.schema) {
-      applyViewport();
+      render();
     }
   });
 }
@@ -150,6 +163,12 @@ async function handleSubmit(event) {
     state.search = "";
     state.selectedTableId = state.schema.tables[0] ? state.schema.tables[0].id : null;
     state.activeSchemas = new Set(state.schema.schemas);
+    state.manualTablePositions = new Map();
+    state.pan = null;
+    state.drag = null;
+    state.suppressClickUntil = 0;
+    state.view = { x: 72, y: 72, scale: 1 };
+    elements.viewport.classList.remove("is-panning");
     elements.searchInput.value = "";
     elements.password.value = "";
     persistConnection(payload);
@@ -169,6 +188,18 @@ function handleClearForm() {
   elements.sslmode.value = "prefer";
   window.localStorage.removeItem(STORAGE_KEY);
   setStatus("Đã xóa thông tin kết nối đã lưu.", "success");
+}
+
+function handleResetView() {
+  if (!state.schema) {
+    resetViewport();
+    return;
+  }
+
+  state.manualTablePositions = new Map();
+  render();
+  fitToViewport();
+  setStatus("Đã reset layout và góc nhìn.", "success");
 }
 
 function handleSearchInput(event) {
@@ -216,7 +247,62 @@ function handleSchemaFilterClick(event) {
   render();
 }
 
+function handleCardPointerDown(event) {
+  const handle = event.target.closest("[data-drag-handle]");
+  const card = event.target.closest("[data-card-table-id]");
+
+  if (!handle || !card || !state.schema) {
+    return;
+  }
+
+  const tableId = card.getAttribute("data-card-table-id");
+  if (!tableId) {
+    return;
+  }
+
+  const position = state.layout.tables.get(tableId);
+  if (!position) {
+    return;
+  }
+
+  event.preventDefault();
+  event.stopPropagation();
+
+  state.drag = {
+    pointerId: event.pointerId,
+    tableId,
+    startClientX: event.clientX,
+    startClientY: event.clientY,
+    originX: position.x,
+    originY: position.y,
+    moved: false,
+  };
+  state.pan = null;
+  state.selectedTableId = tableId;
+  state.suppressClickUntil = 0;
+
+  updateCardSelectionClasses();
+  renderTableList();
+  renderInspector();
+  renderEdgesLayer();
+  elements.viewport.classList.remove("is-panning");
+
+  if (typeof card.setPointerCapture === "function") {
+    try {
+      card.setPointerCapture(event.pointerId);
+    } catch {
+      // Ignore pointer capture failures and continue dragging.
+    }
+  }
+
+  card.classList.add("is-dragging");
+}
+
 function handleNodeClick(event) {
+  if (Date.now() < state.suppressClickUntil) {
+    return;
+  }
+
   const card = event.target.closest("[data-card-table-id]");
   if (!card) {
     return;
@@ -231,7 +317,7 @@ function handleNodeClick(event) {
 }
 
 function handlePointerDown(event) {
-  if (event.button !== 0) {
+  if (event.button !== 0 || state.drag) {
     return;
   }
 
@@ -250,6 +336,22 @@ function handlePointerDown(event) {
 }
 
 function handlePointerMove(event) {
+  if (state.drag) {
+    if (state.drag.pointerId !== event.pointerId) {
+      return;
+    }
+
+    const deltaX = (event.clientX - state.drag.startClientX) / state.view.scale;
+    const deltaY = (event.clientY - state.drag.startClientY) / state.view.scale;
+
+    if (Math.abs(deltaX) > 1 || Math.abs(deltaY) > 1) {
+      state.drag.moved = true;
+    }
+
+    moveTable(state.drag.tableId, state.drag.originX + deltaX, state.drag.originY + deltaY, deltaX, deltaY);
+    return;
+  }
+
   if (!state.pan || state.pan.pointerId !== event.pointerId) {
     return;
   }
@@ -263,6 +365,32 @@ function handlePointerMove(event) {
 }
 
 function handlePointerUp(event) {
+  if (state.drag && state.drag.pointerId === event.pointerId) {
+    const drag = state.drag;
+    const card = findCardElement(drag.tableId);
+
+    if (card) {
+      card.classList.remove("is-dragging");
+
+      if (typeof card.releasePointerCapture === "function") {
+        try {
+          card.releasePointerCapture(event.pointerId);
+        } catch {
+          // Ignore release failures.
+        }
+      }
+    }
+
+    state.drag = null;
+
+    if (drag.moved) {
+      state.suppressClickUntil = Date.now() + 220;
+      flushDragLayout();
+    }
+
+    return;
+  }
+
   if (!state.pan || state.pan.pointerId !== event.pointerId) {
     return;
   }
@@ -278,11 +406,11 @@ function handleWheel(event) {
 
   event.preventDefault();
 
-  const rect = elements.viewport.getBoundingClientRect();
-  const pointerX = event.clientX - rect.left;
-  const pointerY = event.clientY - rect.top;
+  const viewport = getViewportRect();
+  const pointerX = event.clientX - viewport.left;
+  const pointerY = event.clientY - viewport.top;
   const factor = event.deltaY < 0 ? 1.08 : 0.92;
-  const nextScale = clamp(state.view.scale * factor, 0.35, 1.6);
+  const nextScale = clamp(state.view.scale * factor, 0.35, 1.7);
   const worldX = (pointerX - state.view.x) / state.view.scale;
   const worldY = (pointerY - state.view.y) / state.view.scale;
 
@@ -327,8 +455,7 @@ function enhanceSchema(schema) {
     relation.targetTableId = `${relation.target.schema}.${relation.target.table}`;
 
     for (const columnName of relation.source.columns) {
-      const key = `${relation.sourceTableId}:${columnName}`;
-      foreignKeyMap.set(key, true);
+      foreignKeyMap.set(`${relation.sourceTableId}:${columnName}`, true);
     }
 
     linkRelation(relationsByTable, relation.sourceTableId, relation);
@@ -344,7 +471,7 @@ function enhanceSchema(schema) {
     relationCount: (relationsByTable.get(table.id) || []).length,
   }));
 
-  const schemas = [...new Set(tables.map((table) => table.schema))].sort((a, b) => a.localeCompare(b));
+  const schemas = [...new Set(tables.map((table) => table.schema))].sort((left, right) => left.localeCompare(right));
 
   return {
     ...schema,
@@ -369,15 +496,18 @@ function render() {
     return;
   }
 
-  const visibleTableIds = computeVisibleTableIds();
-  state.visibleTableIds = visibleTableIds;
-  state.currentTables = state.schema.tables.filter((table) => visibleTableIds.has(table.id));
+  state.visibleTableIds = computeVisibleTableIds();
+  state.currentTables = sortTablesForDisplay(state.schema.tables.filter((table) => state.visibleTableIds.has(table.id)));
   state.currentRelationships = state.schema.relationships.filter(
-    (relation) => visibleTableIds.has(relation.sourceTableId) && visibleTableIds.has(relation.targetTableId),
+    (relation) => state.visibleTableIds.has(relation.sourceTableId) && state.visibleTableIds.has(relation.targetTableId),
   );
 
-  if (state.selectedTableId && !visibleTableIds.has(state.selectedTableId)) {
+  if (state.selectedTableId && !state.visibleTableIds.has(state.selectedTableId)) {
     state.selectedTableId = state.currentTables[0] ? state.currentTables[0].id : null;
+  }
+
+  if (!state.selectedTableId && state.currentTables[0]) {
+    state.selectedTableId = state.currentTables[0].id;
   }
 
   state.layout = buildLayout(state.currentTables);
@@ -392,6 +522,15 @@ function render() {
 }
 
 function renderDisconnectedState() {
+  state.currentTables = [];
+  state.currentRelationships = [];
+  state.layout = {
+    tables: new Map(),
+    groups: [],
+    width: getViewportRect().width,
+    height: getViewportRect().height,
+  };
+
   elements.emptyState.hidden = false;
   elements.stats.innerHTML = `
     <article class="stat-card">
@@ -423,6 +562,7 @@ function renderDisconnectedState() {
   elements.schemas.innerHTML = "";
   elements.nodes.innerHTML = "";
   elements.edges.innerHTML = "";
+  applyStageMetrics();
 }
 
 function computeVisibleTableIds() {
@@ -434,9 +574,7 @@ function computeVisibleTableIds() {
   const hasSearch = Boolean(state.search);
 
   for (const table of state.schema.tables) {
-    const schemaAllowed = isSchemaVisible(table.schema);
-
-    if (!schemaAllowed) {
+    if (!isSchemaVisible(table.schema)) {
       continue;
     }
 
@@ -475,6 +613,18 @@ function tableMatchesSearch(table, search) {
   return haystacks.some((value) => value.toLowerCase().includes(search));
 }
 
+function sortTablesForDisplay(tables) {
+  return tables
+    .slice()
+    .sort(
+      (left, right) =>
+        left.schema.localeCompare(right.schema) ||
+        right.relationCount - left.relationCount ||
+        right.columns.length - left.columns.length ||
+        left.name.localeCompare(right.name),
+    );
+}
+
 function renderStats() {
   elements.stats.innerHTML = `
     <article class="stat-card">
@@ -493,8 +643,7 @@ function renderStats() {
 }
 
 function renderSchemaFilters() {
-  const allActive =
-    state.activeSchemas.size === 0 || state.schema.schemas.every((schema) => state.activeSchemas.has(schema));
+  const allActive = state.schema.schemas.length > 0 && state.activeSchemas.size === state.schema.schemas.length;
 
   elements.schemaFilters.innerHTML = [
     `<button class="chip ${allActive ? "is-active" : ""}" type="button" data-schema-filter="__all__">Tất cả</button>`,
@@ -537,7 +686,7 @@ function renderTableList() {
 function renderWorkspaceHeader() {
   const generatedAt = formatDate(state.schema.generatedAt);
   elements.workspaceTitle.textContent = `Sơ đồ schema • ${state.schema.database}`;
-  elements.workspaceMeta.textContent = `${state.currentTables.length} bảng hiển thị • ${state.currentRelationships.length} quan hệ • cập nhật ${generatedAt}`;
+  elements.workspaceMeta.textContent = `${state.currentTables.length} bảng hiển thị • ${state.currentRelationships.length} quan hệ • cập nhật ${generatedAt} • kéo phần đầu bảng để đặt tay`;
 }
 
 function renderInspector() {
@@ -551,6 +700,15 @@ function renderInspector() {
   }
 
   const table = state.schema.tableMap.get(state.selectedTableId);
+  if (!table) {
+    elements.inspector.innerHTML = `
+      <p class="inspector-empty">
+        Bảng đang chọn không còn hiển thị trong bộ lọc hiện tại.
+      </p>
+    `;
+    return;
+  }
+
   const relatedRelations = (state.schema.relationsByTable.get(table.id) || []).slice().sort((left, right) => {
     return left.name.localeCompare(right.name);
   });
@@ -594,14 +752,18 @@ function renderInspector() {
                     const otherSide = isSource ? relation.target : relation.source;
                     const localColumns = isSource ? relation.source.columns : relation.target.columns;
                     const remoteColumns = isSource ? relation.target.columns : relation.source.columns;
+                    const directionLabel = isSource
+                      ? `FK tới ${otherSide.table}`
+                      : `Được ${otherSide.table} tham chiếu`;
+                    const actionSummary = summarizeRelationActions(relation);
 
                     return `
                       <div class="detail-item">
-                        <div class="detail-name">${escapeHtml(relation.name)}</div>
+                        <div class="detail-name">${escapeHtml(directionLabel)}</div>
                         <div class="detail-meta">
-                          ${escapeHtml(localColumns.join(", "))} → ${escapeHtml(otherSide.schema)}.${escapeHtml(otherSide.table)} (${escapeHtml(remoteColumns.join(", "))})
+                          ${escapeHtml(formatCompactRelationColumns(localColumns, otherSide.table, remoteColumns))}
                         </div>
-                        <div class="detail-meta">on update ${escapeHtml(relation.onUpdate)} • on delete ${escapeHtml(relation.onDelete)}</div>
+                        <div class="detail-meta">${escapeHtml(actionSummary)}</div>
                       </div>
                     `;
                   })
@@ -615,6 +777,15 @@ function renderInspector() {
 }
 
 function buildLayout(tables) {
+  if (!tables.length) {
+    return {
+      tables: new Map(),
+      groups: [],
+      width: getViewportRect().width,
+      height: getViewportRect().height,
+    };
+  }
+
   const grouped = new Map();
 
   for (const table of tables) {
@@ -625,51 +796,193 @@ function buildLayout(tables) {
     grouped.get(table.schema).push(table);
   }
 
-  const orderedSchemas = [...grouped.keys()].sort((a, b) => a.localeCompare(b));
-  const tableLayout = new Map();
-  const groups = [];
-  let maxHeight = 0;
+  const schemaEntries = [...grouped.entries()].sort(
+    (left, right) => right[1].length - left[1].length || left[0].localeCompare(right[0]),
+  );
+  const rowLimit = Math.max(getViewportRect().width + GROUP_GAP_X, 1580);
+  const positions = new Map();
+  let cursorX = STAGE_PADDING;
+  let cursorY = STAGE_PADDING;
+  let rowHeight = 0;
 
-  orderedSchemas.forEach((schema, columnIndex) => {
-    const schemaTables = grouped.get(schema).slice().sort((a, b) => a.name.localeCompare(b.name));
-    const x = 48 + columnIndex * (CARD_WIDTH + COLUMN_GAP);
-    let y = GROUP_TOP_PADDING;
+  for (const [, schemaTables] of schemaEntries) {
+    const cluster = buildSchemaCluster(schemaTables);
+
+    if (cursorX > STAGE_PADDING && cursorX + cluster.width > rowLimit) {
+      cursorX = STAGE_PADDING;
+      cursorY += rowHeight + GROUP_GAP_Y;
+      rowHeight = 0;
+    }
+
+    for (const entry of cluster.tables) {
+      positions.set(entry.tableId, {
+        x: cursorX + entry.x,
+        y: cursorY + entry.y,
+        width: CARD_WIDTH,
+        height: entry.height,
+      });
+    }
+
+    rowHeight = Math.max(rowHeight, cluster.height);
+    cursorX += cluster.width + GROUP_GAP_X;
+  }
+
+  for (const table of tables) {
+    const manualPosition = state.manualTablePositions.get(table.id);
+    const position = positions.get(table.id);
+
+    if (manualPosition && position) {
+      position.x = manualPosition.x;
+      position.y = manualPosition.y;
+    }
+  }
+
+  const bounds = computeLayoutBounds(tables, positions);
+
+  return {
+    tables: positions,
+    groups: bounds.groups,
+    width: bounds.width,
+    height: bounds.height,
+  };
+}
+
+function buildSchemaCluster(schemaTables) {
+  const sortedTables = schemaTables.slice().sort(
+    (left, right) =>
+      right.relationCount - left.relationCount ||
+      right.columns.length - left.columns.length ||
+      left.name.localeCompare(right.name),
+  );
+  const columns = sortedTables.length >= 4 ? 2 : 1;
+  const columnHeights = new Array(columns).fill(0);
+  const entries = [];
+
+  for (const table of sortedTables) {
+    const height = getCardHeight(table);
+    const columnIndex = indexOfSmallest(columnHeights);
+    const x = GROUP_FRAME_PADDING + columnIndex * (CARD_WIDTH + GROUP_COLUMN_GAP);
+    const y = GROUP_HEADER_HEIGHT + GROUP_FRAME_PADDING + columnHeights[columnIndex];
+
+    entries.push({
+      tableId: table.id,
+      x,
+      y,
+      height,
+    });
+
+    columnHeights[columnIndex] += height + GROUP_ROW_GAP;
+  }
+
+  const contentHeight = Math.max(
+    0,
+    ...columnHeights.map((value) => {
+      return value > 0 ? value - GROUP_ROW_GAP : 0;
+    }),
+  );
+
+  return {
+    width: GROUP_FRAME_PADDING * 2 + columns * CARD_WIDTH + (columns - 1) * GROUP_COLUMN_GAP,
+    height: GROUP_HEADER_HEIGHT + GROUP_FRAME_PADDING + contentHeight + GROUP_FRAME_PADDING,
+    tables: entries,
+  };
+}
+
+function computeLayoutBounds(tables, positions) {
+  const grouped = new Map();
+
+  for (const table of tables) {
+    if (!grouped.has(table.schema)) {
+      grouped.set(table.schema, []);
+    }
+
+    grouped.get(table.schema).push(table);
+  }
+
+  const groups = [];
+  const viewport = getViewportRect();
+  let maxRight = viewport.width;
+  let maxBottom = viewport.height;
+
+  for (const [schema, schemaTables] of grouped.entries()) {
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = 0;
+    let maxY = 0;
 
     for (const table of schemaTables) {
-      const height = CARD_HEADER_HEIGHT + table.columns.length * COLUMN_HEIGHT + 18;
-      tableLayout.set(table.id, {
-        x,
-        y,
-        width: CARD_WIDTH,
-        height,
-      });
-      y += height + ROW_GAP;
+      const position = positions.get(table.id);
+
+      if (!position) {
+        continue;
+      }
+
+      minX = Math.min(minX, position.x);
+      minY = Math.min(minY, position.y);
+      maxX = Math.max(maxX, position.x + position.width);
+      maxY = Math.max(maxY, position.y + position.height);
     }
+
+    if (!Number.isFinite(minX) || !Number.isFinite(minY)) {
+      continue;
+    }
+
+    const x = Math.max(16, minX - GROUP_FRAME_PADDING);
+    const y = Math.max(16, minY - GROUP_HEADER_HEIGHT + 18);
+    const width = maxX - minX + GROUP_FRAME_PADDING * 2;
+    const height = maxY - minY + GROUP_HEADER_HEIGHT + GROUP_FRAME_EXTRA_BOTTOM - 18;
 
     groups.push({
       schema,
       x,
-      y: 18,
-      width: CARD_WIDTH,
+      y,
+      width,
+      height,
+      count: schemaTables.length,
     });
-    maxHeight = Math.max(maxHeight, y);
-  });
+
+    maxRight = Math.max(maxRight, x + width + STAGE_PADDING);
+    maxBottom = Math.max(maxBottom, y + height + STAGE_PADDING);
+  }
+
+  for (const position of positions.values()) {
+    maxRight = Math.max(maxRight, position.x + position.width + STAGE_PADDING);
+    maxBottom = Math.max(maxBottom, position.y + position.height + STAGE_PADDING);
+  }
+
+  groups.sort((left, right) => left.y - right.y || left.x - right.x || left.schema.localeCompare(right.schema));
 
   return {
-    tables: tableLayout,
     groups,
-    width: Math.max(orderedSchemas.length * (CARD_WIDTH + COLUMN_GAP) + 120, elements.viewport.clientWidth),
-    height: Math.max(maxHeight + GROUP_LABEL_HEIGHT, elements.viewport.clientHeight),
+    width: maxRight,
+    height: maxBottom,
   };
+}
+
+function getCardHeight(table) {
+  return CARD_HEADER_HEIGHT + table.columns.length * COLUMN_HEIGHT + CARD_BOTTOM_PADDING;
+}
+
+function indexOfSmallest(values) {
+  let smallestIndex = 0;
+
+  for (let index = 1; index < values.length; index += 1) {
+    if (values[index] < values[smallestIndex]) {
+      smallestIndex = index;
+    }
+  }
+
+  return smallestIndex;
 }
 
 function renderGraph() {
   const hasData = state.currentTables.length > 0;
+
   elements.emptyState.hidden = hasData;
   elements.emptyState.innerHTML = state.schema
     ? `
         <h2>Không có bảng nào khớp bộ lọc</h2>
-        <p>Thử bật lại schema, xóa từ khóa tìm kiếm hoặc kết nối sang database khác.</p>
+        <p>Thử bật lại schema, xóa từ khóa tìm kiếm hoặc bấm <strong>Sắp xếp lại</strong> sau khi kết nối lại database.</p>
       `
     : `
         <h2>Sẵn sàng đọc schema</h2>
@@ -677,27 +990,48 @@ function renderGraph() {
           Nhập thông tin PostgreSQL ở bên trái, sau đó bấm <strong>Đọc schema</strong> để dựng sơ đồ ERD local.
         </p>
       `;
+
+  applyStageMetrics();
+  renderSchemaGroups();
+  renderNodesLayer();
+  renderEdgesLayer();
+}
+
+function applyStageMetrics() {
   elements.stage.style.width = `${state.layout.width}px`;
   elements.stage.style.height = `${state.layout.height}px`;
   elements.edges.setAttribute("width", String(state.layout.width));
   elements.edges.setAttribute("height", String(state.layout.height));
   elements.edges.setAttribute("viewBox", `0 0 ${state.layout.width} ${state.layout.height}`);
+}
 
+function renderSchemaGroups() {
   elements.schemas.innerHTML = state.layout.groups
     .map(
       (group) => `
-        <div class="schema-block" style="transform: translate(${group.x}px, ${group.y}px); width: ${group.width}px;">
-          ${escapeHtml(group.schema)}
-        </div>
+        <section
+          class="schema-group"
+          style="transform: translate(${group.x}px, ${group.y}px); width: ${group.width}px; height: ${group.height}px;"
+        >
+          <div class="schema-group-header">
+            <span class="schema-group-name">${escapeHtml(group.schema)}</span>
+            <span class="schema-group-count">${group.count} bảng</span>
+          </div>
+        </section>
       `,
     )
     .join("");
+}
 
+function renderNodesLayer() {
   elements.nodes.innerHTML = state.currentTables
     .map((table) => renderCard(table, state.layout.tables.get(table.id)))
     .join("");
+}
 
-  elements.edges.innerHTML = state.currentRelationships.map(renderEdge).join("");
+function renderEdgesLayer() {
+  const routing = buildRoutingGrid(state.currentTables, state.layout.tables);
+  elements.edges.innerHTML = state.currentRelationships.map((relation) => renderEdge(relation, routing)).join("");
 }
 
 function renderCard(table, position) {
@@ -728,19 +1062,22 @@ function renderCard(table, position) {
       data-card-table-id="${escapeAttribute(table.id)}"
       style="transform: translate(${position.x}px, ${position.y}px);"
     >
-      <header class="erd-card-header">
+      <header class="erd-card-header" data-drag-handle="true" title="Kéo để di chuyển bảng">
         <div class="erd-card-title-row">
           <h3 class="erd-card-title">${escapeHtml(table.name)}</h3>
           <span class="erd-card-type">${escapeHtml(table.type)}</span>
         </div>
-        <div class="schema-tag">${escapeHtml(table.schema)}</div>
+        <div class="erd-card-subtitle">
+          <span class="schema-tag">${escapeHtml(table.schema)}</span>
+          <span class="drag-label">${table.relationCount} rel • kéo</span>
+        </div>
       </header>
       <div class="erd-card-columns">${columnsMarkup}</div>
     </article>
   `;
 }
 
-function renderEdge(relation) {
+function renderEdge(relation, routing) {
   const sourcePosition = state.layout.tables.get(relation.sourceTableId);
   const targetPosition = state.layout.tables.get(relation.targetTableId);
 
@@ -752,27 +1089,29 @@ function renderEdge(relation) {
   const targetTable = state.schema.tableMap.get(relation.targetTableId);
   const sourceColumnIndex = averageColumnIndex(sourceTable, relation.source.columns);
   const targetColumnIndex = averageColumnIndex(targetTable, relation.target.columns);
-
-  const sourceY = sourcePosition.y + CARD_HEADER_HEIGHT + sourceColumnIndex * COLUMN_HEIGHT + COLUMN_HEIGHT / 2;
-  const targetY = targetPosition.y + CARD_HEADER_HEIGHT + targetColumnIndex * COLUMN_HEIGHT + COLUMN_HEIGHT / 2;
-  const sourceCenter = sourcePosition.x + sourcePosition.width / 2;
-  const targetCenter = targetPosition.x + targetPosition.width / 2;
-
-  let path;
-
-  if (Math.abs(sourcePosition.x - targetPosition.x) < 10) {
-    const startX = sourcePosition.x + sourcePosition.width;
-    const endX = targetPosition.x + targetPosition.width;
-    const controlX = sourcePosition.x + sourcePosition.width + 120;
-    path = `M ${startX} ${sourceY} C ${controlX} ${sourceY}, ${controlX} ${targetY}, ${endX} ${targetY}`;
-  } else {
-    const startX = sourceCenter <= targetCenter ? sourcePosition.x + sourcePosition.width : sourcePosition.x;
-    const endX = sourceCenter <= targetCenter ? targetPosition.x : targetPosition.x + targetPosition.width;
-    const distance = Math.max(90, Math.abs(endX - startX) * 0.45);
-    const controlAX = sourceCenter <= targetCenter ? startX + distance : startX - distance;
-    const controlBX = sourceCenter <= targetCenter ? endX - distance : endX + distance;
-    path = `M ${startX} ${sourceY} C ${controlAX} ${sourceY}, ${controlBX} ${targetY}, ${endX} ${targetY}`;
-  }
+  const sourceColumnY = sourcePosition.y + CARD_HEADER_HEIGHT + sourceColumnIndex * COLUMN_HEIGHT + COLUMN_HEIGHT / 2;
+  const targetColumnY = targetPosition.y + CARD_HEADER_HEIGHT + targetColumnIndex * COLUMN_HEIGHT + COLUMN_HEIGHT / 2;
+  const sides = chooseEdgeSides(sourcePosition, targetPosition);
+  const sourceEndpoint = buildEdgeEndpoint(sourcePosition, sides.source, sourceColumnY, routing);
+  const targetEndpoint = buildEdgeEndpoint(targetPosition, sides.target, targetColumnY, routing);
+  const freeCells = new Set([
+    getRoutingCellKey(routing, sourceEndpoint.anchorCell.col, sourceEndpoint.anchorCell.row),
+    getRoutingCellKey(routing, targetEndpoint.anchorCell.col, targetEndpoint.anchorCell.row),
+  ]);
+  const routeCells = findGridRoute(sourceEndpoint.anchorCell, targetEndpoint.anchorCell, routing, freeCells);
+  const routePoints = routeCells
+    ? routeCells.slice(1, -1).map((cell) => getRoutingCellCenter(routing, cell.col, cell.row))
+    : buildFallbackRoutePoints(sourceEndpoint.anchor, targetEndpoint.anchor);
+  const points = simplifyOrthogonalPoints([
+    sourceEndpoint.port,
+    sourceEndpoint.bridge,
+    sourceEndpoint.anchor,
+    ...routePoints,
+    targetEndpoint.anchor,
+    targetEndpoint.bridge,
+    targetEndpoint.port,
+  ]);
+  const path = buildSmoothPath(points);
 
   const isActive =
     state.selectedTableId &&
@@ -806,6 +1145,551 @@ function averageColumnIndex(table, columnNames) {
   return sum / positions.length;
 }
 
+function moveTable(tableId, x, y, deltaX = 0, deltaY = 0) {
+  const position = state.layout.tables.get(tableId);
+  if (!position) {
+    return;
+  }
+
+  const proposed = {
+    x: Math.round(Math.max(24, x)),
+    y: Math.round(Math.max(24, y)),
+    width: position.width,
+    height: position.height,
+  };
+  const resolved = resolveDraggedTablePosition(tableId, proposed, deltaX, deltaY) || {
+    x: position.x,
+    y: position.y,
+    width: position.width,
+    height: position.height,
+  };
+
+  position.x = resolved.x;
+  position.y = resolved.y;
+  state.manualTablePositions.set(tableId, { x: resolved.x, y: resolved.y });
+
+  const card = findCardElement(tableId);
+  if (card) {
+    card.style.transform = `translate(${resolved.x}px, ${resolved.y}px)`;
+  }
+
+  scheduleDragLayoutUpdate();
+}
+
+function isTableSlotFree(tableId, candidate) {
+  for (const [otherTableId, otherPosition] of state.layout.tables.entries()) {
+    if (otherTableId === tableId) {
+      continue;
+    }
+
+    if (rectanglesOverlap(candidate, otherPosition, TABLE_COLLISION_GAP)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function resolveDraggedTablePosition(tableId, candidate, deltaX, deltaY) {
+  const current = {
+    x: candidate.x,
+    y: candidate.y,
+    width: candidate.width,
+    height: candidate.height,
+  };
+
+  if (isTableSlotFree(tableId, current)) {
+    return current;
+  }
+
+  const preferHorizontal = Math.abs(deltaX) >= Math.abs(deltaY);
+  const attempts = preferHorizontal
+    ? [
+        { x: current.x, y: state.layout.tables.get(tableId).y, width: current.width, height: current.height },
+        { x: state.layout.tables.get(tableId).x, y: current.y, width: current.width, height: current.height },
+      ]
+    : [
+        { x: state.layout.tables.get(tableId).x, y: current.y, width: current.width, height: current.height },
+        { x: current.x, y: state.layout.tables.get(tableId).y, width: current.width, height: current.height },
+      ];
+
+  for (const attempt of attempts) {
+    const pushed = pushCandidateOutOfCollisions(tableId, attempt, deltaX, deltaY);
+    if (pushed && isTableSlotFree(tableId, pushed)) {
+      return pushed;
+    }
+  }
+
+  const pushed = pushCandidateOutOfCollisions(tableId, current, deltaX, deltaY);
+  if (pushed && isTableSlotFree(tableId, pushed)) {
+    return pushed;
+  }
+
+  return null;
+}
+
+function pushCandidateOutOfCollisions(tableId, candidate, deltaX, deltaY) {
+  const resolved = { ...candidate };
+  const preferHorizontal = Math.abs(deltaX) >= Math.abs(deltaY);
+
+  for (let iteration = 0; iteration < 6; iteration += 1) {
+    let adjusted = false;
+
+    for (const [otherTableId, otherPosition] of state.layout.tables.entries()) {
+      if (otherTableId === tableId) {
+        continue;
+      }
+
+      if (!rectanglesOverlap(resolved, otherPosition, TABLE_COLLISION_GAP)) {
+        continue;
+      }
+
+      adjusted = true;
+
+      if (preferHorizontal) {
+        if (deltaX >= 0) {
+          resolved.x = otherPosition.x - resolved.width - TABLE_COLLISION_GAP;
+        } else {
+          resolved.x = otherPosition.x + otherPosition.width + TABLE_COLLISION_GAP;
+        }
+      } else if (deltaY >= 0) {
+        resolved.y = otherPosition.y - resolved.height - TABLE_COLLISION_GAP;
+      } else {
+        resolved.y = otherPosition.y + otherPosition.height + TABLE_COLLISION_GAP;
+      }
+    }
+
+    if (!adjusted) {
+      resolved.x = Math.max(24, Math.round(resolved.x));
+      resolved.y = Math.max(24, Math.round(resolved.y));
+      return resolved;
+    }
+  }
+
+  return null;
+}
+
+function scheduleDragLayoutUpdate() {
+  if (state.dragFrameRequested) {
+    return;
+  }
+
+  state.dragFrameRequested = true;
+  window.requestAnimationFrame(() => {
+    state.dragFrameRequested = false;
+    flushDragLayout();
+  });
+}
+
+function flushDragLayout() {
+  const bounds = computeLayoutBounds(state.currentTables, state.layout.tables);
+  state.layout.groups = bounds.groups;
+  state.layout.width = bounds.width;
+  state.layout.height = bounds.height;
+  applyStageMetrics();
+  renderSchemaGroups();
+  renderEdgesLayer();
+}
+
+function rectanglesOverlap(leftRect, rightRect, gap) {
+  return !(
+    leftRect.x + leftRect.width + gap <= rightRect.x ||
+    rightRect.x + rightRect.width + gap <= leftRect.x ||
+    leftRect.y + leftRect.height + gap <= rightRect.y ||
+    rightRect.y + rightRect.height + gap <= leftRect.y
+  );
+}
+
+function buildRoutingGrid(tables, positions) {
+  const cols = Math.max(1, Math.ceil(state.layout.width / EDGE_GRID_SIZE) + 2);
+  const rows = Math.max(1, Math.ceil(state.layout.height / EDGE_GRID_SIZE) + 2);
+  const blocked = new Uint8Array(cols * rows);
+
+  for (const table of tables) {
+    const position = positions.get(table.id);
+    if (!position) {
+      continue;
+    }
+
+    const left = Math.max(0, position.x - EDGE_CLEARANCE);
+    const top = Math.max(0, position.y - EDGE_CLEARANCE);
+    const right = position.x + position.width + EDGE_CLEARANCE;
+    const bottom = position.y + position.height + EDGE_CLEARANCE;
+    const startCol = clamp(Math.floor(left / EDGE_GRID_SIZE), 0, cols - 1);
+    const endCol = clamp(Math.floor(right / EDGE_GRID_SIZE), 0, cols - 1);
+    const startRow = clamp(Math.floor(top / EDGE_GRID_SIZE), 0, rows - 1);
+    const endRow = clamp(Math.floor(bottom / EDGE_GRID_SIZE), 0, rows - 1);
+
+    for (let row = startRow; row <= endRow; row += 1) {
+      for (let col = startCol; col <= endCol; col += 1) {
+        blocked[getRoutingCellKey({ cols }, col, row)] = 1;
+      }
+    }
+  }
+
+  return {
+    size: EDGE_GRID_SIZE,
+    cols,
+    rows,
+    blocked,
+  };
+}
+
+function chooseEdgeSides(sourcePosition, targetPosition) {
+  const sourceCenterX = sourcePosition.x + sourcePosition.width / 2;
+  const sourceCenterY = sourcePosition.y + sourcePosition.height / 2;
+  const targetCenterX = targetPosition.x + targetPosition.width / 2;
+  const targetCenterY = targetPosition.y + targetPosition.height / 2;
+  const deltaX = targetCenterX - sourceCenterX;
+  const deltaY = targetCenterY - sourceCenterY;
+
+  if (Math.abs(deltaX) >= Math.abs(deltaY) * 0.9) {
+    return deltaX >= 0
+      ? { source: "right", target: "left" }
+      : { source: "left", target: "right" };
+  }
+
+  return deltaY >= 0
+    ? { source: "bottom", target: "top" }
+    : { source: "top", target: "bottom" };
+}
+
+function buildEdgeEndpoint(position, side, preferredY, routing) {
+  const minY = position.y + 18;
+  const maxY = position.y + position.height - 18;
+  const clampedY = clamp(preferredY, minY, maxY);
+  let port;
+  let bridge;
+  let anchorCell;
+
+  if (side === "left") {
+    port = { x: position.x, y: clampedY };
+    anchorCell = snapAnchorCell(routing, position.x - EDGE_PORT_OFFSET, clampedY, "left");
+  } else if (side === "right") {
+    port = { x: position.x + position.width, y: clampedY };
+    anchorCell = snapAnchorCell(routing, position.x + position.width + EDGE_PORT_OFFSET, clampedY, "right");
+  } else if (side === "top") {
+    port = { x: position.x + position.width / 2, y: position.y };
+    anchorCell = snapAnchorCell(routing, port.x, position.y - EDGE_PORT_OFFSET, "top");
+  } else {
+    port = { x: position.x + position.width / 2, y: position.y + position.height };
+    anchorCell = snapAnchorCell(routing, port.x, position.y + position.height + EDGE_PORT_OFFSET, "bottom");
+  }
+
+  const anchor = getRoutingCellCenter(routing, anchorCell.col, anchorCell.row);
+
+  if (side === "left" || side === "right") {
+    bridge = { x: anchor.x, y: port.y };
+  } else {
+    bridge = { x: port.x, y: anchor.y };
+  }
+
+  return {
+    side,
+    port,
+    bridge,
+    anchor,
+    anchorCell,
+  };
+}
+
+function snapAnchorCell(routing, x, y, side) {
+  const rawCol = x / routing.size - 0.5;
+  const rawRow = y / routing.size - 0.5;
+  let col = Math.round(rawCol);
+  let row = Math.round(rawRow);
+
+  if (side === "left") {
+    col = Math.floor(rawCol);
+  } else if (side === "right") {
+    col = Math.ceil(rawCol);
+  } else if (side === "top") {
+    row = Math.floor(rawRow);
+  } else if (side === "bottom") {
+    row = Math.ceil(rawRow);
+  }
+
+  return {
+    col: clamp(col, 0, routing.cols - 1),
+    row: clamp(row, 0, routing.rows - 1),
+  };
+}
+
+function findGridRoute(startCell, endCell, routing, freeCells) {
+  const startKey = getRoutingCellKey(routing, startCell.col, startCell.row);
+  const endKey = getRoutingCellKey(routing, endCell.col, endCell.row);
+  const open = [startCell];
+  const openKeys = new Set([startKey]);
+  const cameFrom = new Map();
+  const gScore = new Map([[startKey, 0]]);
+  const fScore = new Map([[startKey, gridHeuristic(startCell, endCell)]]);
+  const directions = buildDirectionPriority(startCell, endCell);
+  const maxIterations = routing.cols * routing.rows * 4;
+  let iterations = 0;
+
+  while (open.length && iterations < maxIterations) {
+    iterations += 1;
+    let bestIndex = 0;
+
+    for (let index = 1; index < open.length; index += 1) {
+      const bestNode = open[bestIndex];
+      const node = open[index];
+      const bestKey = getRoutingCellKey(routing, bestNode.col, bestNode.row);
+      const nodeKey = getRoutingCellKey(routing, node.col, node.row);
+
+      if ((fScore.get(nodeKey) ?? Infinity) < (fScore.get(bestKey) ?? Infinity)) {
+        bestIndex = index;
+      }
+    }
+
+    const current = open.splice(bestIndex, 1)[0];
+    const currentKey = getRoutingCellKey(routing, current.col, current.row);
+    openKeys.delete(currentKey);
+
+    if (currentKey === endKey) {
+      return reconstructGridRoute(cameFrom, currentKey, routing);
+    }
+
+    for (const direction of directions) {
+      const nextCol = current.col + direction.col;
+      const nextRow = current.row + direction.row;
+
+      if (!isRoutingCellWalkable(routing, nextCol, nextRow, freeCells)) {
+        continue;
+      }
+
+      const nextKey = getRoutingCellKey(routing, nextCol, nextRow);
+      const tentativeScore = (gScore.get(currentKey) ?? Infinity) + 1;
+
+      if (tentativeScore >= (gScore.get(nextKey) ?? Infinity)) {
+        continue;
+      }
+
+      cameFrom.set(nextKey, currentKey);
+      gScore.set(nextKey, tentativeScore);
+      fScore.set(nextKey, tentativeScore + gridHeuristic({ col: nextCol, row: nextRow }, endCell));
+
+      if (!openKeys.has(nextKey)) {
+        open.push({ col: nextCol, row: nextRow });
+        openKeys.add(nextKey);
+      }
+    }
+  }
+
+  return null;
+}
+
+function buildDirectionPriority(startCell, endCell) {
+  const horizontal = endCell.col >= startCell.col ? { col: 1, row: 0 } : { col: -1, row: 0 };
+  const reverseHorizontal = { col: -horizontal.col, row: 0 };
+  const vertical = endCell.row >= startCell.row ? { col: 0, row: 1 } : { col: 0, row: -1 };
+  const reverseVertical = { col: 0, row: -vertical.row };
+
+  return [horizontal, vertical, reverseHorizontal, reverseVertical];
+}
+
+function isRoutingCellWalkable(routing, col, row, freeCells) {
+  if (col < 0 || row < 0 || col >= routing.cols || row >= routing.rows) {
+    return false;
+  }
+
+  const key = getRoutingCellKey(routing, col, row);
+  return freeCells.has(key) || routing.blocked[key] === 0;
+}
+
+function reconstructGridRoute(cameFrom, endKey, routing) {
+  const path = [];
+  let currentKey = endKey;
+
+  while (currentKey !== undefined) {
+    path.push(getRoutingCellFromKey(routing, currentKey));
+    currentKey = cameFrom.get(currentKey);
+  }
+
+  path.reverse();
+  return path;
+}
+
+function gridHeuristic(leftCell, rightCell) {
+  return Math.abs(leftCell.col - rightCell.col) + Math.abs(leftCell.row - rightCell.row);
+}
+
+function buildPathFromPoints(points) {
+  if (!points.length) {
+    return "";
+  }
+
+  const [firstPoint, ...restPoints] = points;
+  return `M ${firstPoint.x} ${firstPoint.y}` + restPoints.map((point) => ` L ${point.x} ${point.y}`).join("");
+}
+
+function buildSmoothPath(points) {
+  if (!points.length) {
+    return "";
+  }
+
+  if (points.length === 1) {
+    return `M ${points[0].x} ${points[0].y}`;
+  }
+
+  if (points.length === 2) {
+    return `M ${points[0].x} ${points[0].y} L ${points[1].x} ${points[1].y}`;
+  }
+
+  let path = `M ${points[0].x} ${points[0].y}`;
+
+  for (let index = 1; index < points.length - 1; index += 1) {
+    const previousPoint = points[index - 1];
+    const currentPoint = points[index];
+    const nextPoint = points[index + 1];
+    const startCorner = movePointToward(currentPoint, previousPoint, EDGE_CORNER_RADIUS);
+    const endCorner = movePointToward(currentPoint, nextPoint, EDGE_CORNER_RADIUS);
+
+    path += ` L ${startCorner.x} ${startCorner.y}`;
+    path += ` Q ${currentPoint.x} ${currentPoint.y} ${endCorner.x} ${endCorner.y}`;
+  }
+
+  const lastPoint = points[points.length - 1];
+  path += ` L ${lastPoint.x} ${lastPoint.y}`;
+
+  return path;
+}
+
+function buildFallbackRoutePoints(sourceAnchor, targetAnchor) {
+  if (Math.abs(sourceAnchor.x - targetAnchor.x) >= Math.abs(sourceAnchor.y - targetAnchor.y)) {
+    return [{ x: targetAnchor.x, y: sourceAnchor.y }];
+  }
+
+  return [{ x: sourceAnchor.x, y: targetAnchor.y }];
+}
+
+function simplifyOrthogonalPoints(points) {
+  const simplified = [];
+
+  for (const rawPoint of points) {
+    const point = {
+      x: Math.round(rawPoint.x),
+      y: Math.round(rawPoint.y),
+    };
+
+    if (!simplified.length) {
+      simplified.push(point);
+      continue;
+    }
+
+    const lastPoint = simplified[simplified.length - 1];
+    if (lastPoint.x === point.x && lastPoint.y === point.y) {
+      continue;
+    }
+
+    if (simplified.length >= 2) {
+      const previousPoint = simplified[simplified.length - 2];
+      const sameVerticalLine = previousPoint.x === lastPoint.x && lastPoint.x === point.x;
+      const sameHorizontalLine = previousPoint.y === lastPoint.y && lastPoint.y === point.y;
+
+      if (sameVerticalLine || sameHorizontalLine) {
+        simplified[simplified.length - 1] = point;
+        continue;
+      }
+    }
+
+    simplified.push(point);
+  }
+
+  return simplified;
+}
+
+function movePointToward(fromPoint, towardPoint, distanceLimit) {
+  const deltaX = towardPoint.x - fromPoint.x;
+  const deltaY = towardPoint.y - fromPoint.y;
+  const distance = Math.abs(deltaX) + Math.abs(deltaY);
+  const distanceToUse = Math.min(distanceLimit, distance / 2);
+
+  if (deltaX !== 0) {
+    return {
+      x: fromPoint.x + Math.sign(deltaX) * distanceToUse,
+      y: fromPoint.y,
+    };
+  }
+
+  return {
+    x: fromPoint.x,
+    y: fromPoint.y + Math.sign(deltaY) * distanceToUse,
+  };
+}
+
+function formatCompactRelationColumns(localColumns, remoteTable, remoteColumns) {
+  if (localColumns.length === 1 && remoteColumns.length === 1) {
+    return `${localColumns[0]} -> ${remoteTable}.${remoteColumns[0]}`;
+  }
+
+  return `(${localColumns.join(", ")}) -> ${remoteTable}(${remoteColumns.join(", ")})`;
+}
+
+function summarizeRelationActions(relation) {
+  const actionParts = [];
+
+  if (relation.onDelete !== "NO ACTION") {
+    actionParts.push(`xóa ${normalizeRelationAction(relation.onDelete)}`);
+  }
+
+  if (relation.onUpdate !== "NO ACTION") {
+    actionParts.push(`cập nhật ${normalizeRelationAction(relation.onUpdate)}`);
+  }
+
+  if (!actionParts.length) {
+    return "ràng buộc mặc định";
+  }
+
+  return actionParts.join(" • ");
+}
+
+function normalizeRelationAction(action) {
+  switch (action) {
+    case "CASCADE":
+      return "lan truyền";
+    case "SET NULL":
+      return "set null";
+    case "SET DEFAULT":
+      return "set mặc định";
+    case "RESTRICT":
+      return "chặn";
+    default:
+      return action.toLowerCase();
+  }
+}
+
+function getRoutingCellKey(routing, col, row) {
+  return row * routing.cols + col;
+}
+
+function getRoutingCellFromKey(routing, key) {
+  return {
+    col: key % routing.cols,
+    row: Math.floor(key / routing.cols),
+  };
+}
+
+function getRoutingCellCenter(routing, col, row) {
+  return {
+    x: (col + 0.5) * routing.size,
+    y: (row + 0.5) * routing.size,
+  };
+}
+
+function updateCardSelectionClasses() {
+  const cards = elements.nodes.querySelectorAll(".erd-card");
+
+  for (const card of cards) {
+    const tableId = card.getAttribute("data-card-table-id");
+    card.classList.toggle("is-selected", tableId === state.selectedTableId);
+  }
+}
+
+function findCardElement(tableId) {
+  return elements.nodes.querySelector(`[data-card-table-id="${escapeSelectorValue(tableId)}"]`);
+}
+
 function selectTable(tableId, options) {
   state.selectedTableId = tableId;
   render();
@@ -821,10 +1705,10 @@ function centerTable(tableId) {
     return;
   }
 
-  const viewportRect = elements.viewport.getBoundingClientRect();
-  const scale = Math.max(state.view.scale, 0.9);
-  const targetX = viewportRect.width / 2 - (tablePosition.x + tablePosition.width / 2) * scale;
-  const targetY = viewportRect.height / 2 - (tablePosition.y + tablePosition.height / 2) * scale;
+  const viewport = getViewportRect();
+  const scale = Math.max(state.view.scale, 0.85);
+  const targetX = viewport.width / 2 - (tablePosition.x + tablePosition.width / 2) * scale;
+  const targetY = viewport.height / 2 - (tablePosition.y + tablePosition.height / 2) * scale;
 
   state.view.scale = scale;
   state.view.x = targetX;
@@ -837,25 +1721,25 @@ function fitToViewport() {
     return;
   }
 
-  const viewportRect = elements.viewport.getBoundingClientRect();
-  const margin = 80;
-  const contentWidth = Math.max(state.layout.width - 32, 1);
-  const contentHeight = Math.max(state.layout.height - 32, 1);
+  const viewport = getViewportRect();
+  const margin = 120;
+  const contentWidth = Math.max(state.layout.width, 1);
+  const contentHeight = Math.max(state.layout.height, 1);
   const scale = clamp(
-    Math.min((viewportRect.width - margin) / contentWidth, (viewportRect.height - margin) / contentHeight),
+    Math.min((viewport.width - margin) / contentWidth, (viewport.height - margin) / contentHeight),
     0.35,
-    1,
+    1.05,
   );
 
   state.view.scale = scale;
-  state.view.x = (viewportRect.width - contentWidth * scale) / 2;
-  state.view.y = (viewportRect.height - contentHeight * scale) / 2;
+  state.view.x = (viewport.width - contentWidth * scale) / 2;
+  state.view.y = (viewport.height - contentHeight * scale) / 2;
   applyViewport();
 }
 
 function resetViewport() {
-  state.view.x = 64;
-  state.view.y = 64;
+  state.view.x = 72;
+  state.view.y = 72;
   state.view.scale = 1;
   applyViewport();
 }
@@ -865,7 +1749,18 @@ function applyViewport() {
 }
 
 function isSchemaVisible(schemaName) {
-  return state.activeSchemas.size === 0 || state.activeSchemas.has(schemaName);
+  return state.activeSchemas.has(schemaName);
+}
+
+function getViewportRect() {
+  const rect = elements.viewport.getBoundingClientRect();
+
+  return {
+    left: rect.left,
+    top: rect.top,
+    width: rect.width || elements.viewport.clientWidth || 1200,
+    height: rect.height || elements.viewport.clientHeight || 720,
+  };
 }
 
 function formatDate(value) {
@@ -894,4 +1789,12 @@ function escapeHtml(value) {
 
 function escapeAttribute(value) {
   return escapeHtml(value);
+}
+
+function escapeSelectorValue(value) {
+  if (window.CSS && typeof window.CSS.escape === "function") {
+    return window.CSS.escape(value);
+  }
+
+  return String(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }

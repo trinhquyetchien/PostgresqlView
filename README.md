@@ -33,6 +33,8 @@ http://127.0.0.1:3210
 - Đọc danh sách bảng người dùng trong PostgreSQL
 - Hiển thị cột, kiểu dữ liệu, PK, FK
 - Vẽ quan hệ foreign key giữa các bảng
+- Auto-layout theo cụm schema để sơ đồ dễ nhìn hơn
+- Kéo thả từng bảng và bấm `Sắp xếp lại` để quay về layout tự động
 - Tìm kiếm theo tên schema, bảng, cột
 - Pan / zoom / fit trong sơ đồ
 
