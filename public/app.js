@@ -2,8 +2,8 @@
 
 const STORAGE_KEY = "postgresql-view.connection";
 const CARD_WIDTH = 320;
-const CARD_HEADER_HEIGHT = 84;
-const COLUMN_HEIGHT = 30;
+const CARD_HEADER_HEIGHT = 112;
+const COLUMN_HEIGHT = 38;
 const CARD_BOTTOM_PADDING = 20;
 const STAGE_PADDING = 88;
 const GROUP_HEADER_HEIGHT = 70;
@@ -18,6 +18,10 @@ const EDGE_GRID_SIZE = 36;
 const EDGE_CLEARANCE = 32;
 const EDGE_PORT_OFFSET = 56;
 const EDGE_CORNER_RADIUS = 12;
+const SEARCH_DEBOUNCE_MS = 110;
+const FAST_EDGE_RELATION_THRESHOLD = 180;
+const FAST_EDGE_TABLE_THRESHOLD = 72;
+const LIVE_EDGE_PORT_OFFSET = 44;
 
 const state = {
   schema: null,
@@ -43,6 +47,8 @@ const state = {
   drag: null,
   suppressClickUntil: 0,
   dragFrameRequested: false,
+  dragFrameTableId: null,
+  searchDebounceTimer: 0,
 };
 
 const elements = {
@@ -63,6 +69,7 @@ const elements = {
   inspector: document.querySelector("#inspector"),
   workspaceTitle: document.querySelector("#workspace-title"),
   workspaceMeta: document.querySelector("#workspace-meta"),
+  workspaceSummary: document.querySelector("#workspace-summary"),
   resetButton: document.querySelector("#reset-button"),
   viewport: document.querySelector("#graph-viewport"),
   stage: document.querySelector("#graph-stage"),
@@ -166,7 +173,12 @@ async function handleSubmit(event) {
     state.manualTablePositions = new Map();
     state.pan = null;
     state.drag = null;
+    state.dragFrameTableId = null;
     state.suppressClickUntil = 0;
+    if (state.searchDebounceTimer) {
+      window.clearTimeout(state.searchDebounceTimer);
+      state.searchDebounceTimer = 0;
+    }
     state.view = { x: 72, y: 72, scale: 1 };
     elements.viewport.classList.remove("is-panning");
     elements.searchInput.value = "";
@@ -203,8 +215,22 @@ function handleResetView() {
 }
 
 function handleSearchInput(event) {
-  state.search = event.target.value.trim().toLowerCase();
-  render();
+  const nextSearch = event.target.value.trim().toLowerCase();
+
+  if (state.searchDebounceTimer) {
+    window.clearTimeout(state.searchDebounceTimer);
+  }
+
+  state.searchDebounceTimer = window.setTimeout(() => {
+    state.searchDebounceTimer = 0;
+
+    if (state.search === nextSearch) {
+      return;
+    }
+
+    state.search = nextSearch;
+    render();
+  }, SEARCH_DEBOUNCE_MS);
 }
 
 function handleTableListClick(event) {
@@ -281,10 +307,7 @@ function handleCardPointerDown(event) {
   state.selectedTableId = tableId;
   state.suppressClickUntil = 0;
 
-  updateCardSelectionClasses();
-  renderTableList();
-  renderInspector();
-  renderEdgesLayer();
+  updateSelectionUI();
   elements.viewport.classList.remove("is-panning");
 
   if (typeof card.setPointerCapture === "function") {
@@ -462,14 +485,36 @@ function enhanceSchema(schema) {
     linkRelation(relationsByTable, relation.targetTableId, relation);
   }
 
-  const tables = schema.tables.map((table) => ({
-    ...table,
-    columns: table.columns.map((column) => ({
+  const tables = schema.tables.map((table) => {
+    const columns = table.columns.map((column) => ({
       ...column,
       isForeignKey: foreignKeyMap.has(`${table.id}:${column.name}`),
-    })),
-    relationCount: (relationsByTable.get(table.id) || []).length,
-  }));
+    }));
+    const primaryKeyCount = columns.filter((column) => column.isPrimaryKey).length;
+    const foreignKeyCount = columns.filter((column) => column.isForeignKey).length;
+    const nullableCount = columns.filter((column) => column.nullable).length;
+    const identityCount = columns.filter((column) => column.isIdentity).length;
+    const defaultCount = columns.filter((column) => column.hasDefault).length;
+
+    return {
+      ...table,
+      columns,
+      relationCount: (relationsByTable.get(table.id) || []).length,
+      primaryKeyCount,
+      foreignKeyCount,
+      nullableCount,
+      identityCount,
+      defaultCount,
+      searchText: [
+        table.schema,
+        table.name,
+        `${table.schema}.${table.name}`,
+        ...columns.map((column) => `${column.name} ${column.dataType}`),
+      ]
+        .join(" ")
+        .toLowerCase(),
+    };
+  });
 
   const schemas = [...new Set(tables.map((table) => table.schema))].sort((left, right) => left.localeCompare(right));
 
@@ -516,6 +561,7 @@ function render() {
   renderSchemaFilters();
   renderTableList();
   renderWorkspaceHeader();
+  renderWorkspaceSummary();
   renderInspector();
   renderGraph();
   applyViewport();
@@ -554,6 +600,7 @@ function renderDisconnectedState() {
   `;
   elements.workspaceTitle.textContent = "Sơ đồ schema";
   elements.workspaceMeta.textContent = "Chưa có dữ liệu";
+  elements.workspaceSummary.innerHTML = "";
   elements.inspector.innerHTML = `
     <p class="inspector-empty">
       Chọn một bảng để xem cột, kiểu dữ liệu và các quan hệ liên quan.
@@ -603,14 +650,7 @@ function computeVisibleTableIds() {
 }
 
 function tableMatchesSearch(table, search) {
-  const haystacks = [
-    table.schema,
-    table.name,
-    `${table.schema}.${table.name}`,
-    ...table.columns.map((column) => `${column.name} ${column.dataType}`),
-  ];
-
-  return haystacks.some((value) => value.toLowerCase().includes(search));
+  return table.searchText.includes(search);
 }
 
 function sortTablesForDisplay(tables) {
@@ -676,7 +716,15 @@ function renderTableList() {
             <span class="table-name">${escapeHtml(table.name)}</span>
             <span class="table-count">${table.relationCount} rel</span>
           </div>
-          <div class="table-meta">${escapeHtml(table.schema)} • ${table.columns.length} cột</div>
+          <div class="table-meta-row">
+            <span class="table-meta">${escapeHtml(table.schema)}</span>
+            <span class="table-meta">${table.columns.length} cột</span>
+          </div>
+          <div class="table-chip-row">
+            <span class="meta-chip meta-chip-accent">${table.primaryKeyCount || 0} PK</span>
+            <span class="meta-chip meta-chip-info">${table.foreignKeyCount || 0} FK</span>
+            <span class="meta-chip meta-chip-muted">${table.nullableCount || 0} nullable</span>
+          </div>
         </button>
       `,
     )
@@ -685,8 +733,57 @@ function renderTableList() {
 
 function renderWorkspaceHeader() {
   const generatedAt = formatDate(state.schema.generatedAt);
+  const selectedTable = state.selectedTableId ? state.schema.tableMap.get(state.selectedTableId) : null;
+  const selectedLabel = selectedTable ? ` • chọn ${selectedTable.schema}.${selectedTable.name}` : "";
+
   elements.workspaceTitle.textContent = `Sơ đồ schema • ${state.schema.database}`;
-  elements.workspaceMeta.textContent = `${state.currentTables.length} bảng hiển thị • ${state.currentRelationships.length} quan hệ • cập nhật ${generatedAt} • kéo phần đầu bảng để đặt tay`;
+  elements.workspaceMeta.textContent = `${state.currentTables.length} bảng hiển thị • ${state.currentRelationships.length} quan hệ • cập nhật ${generatedAt} • kéo phần đầu bảng để đặt tay${selectedLabel}`;
+}
+
+function renderWorkspaceSummary() {
+  if (!state.schema) {
+    elements.workspaceSummary.innerHTML = "";
+    return;
+  }
+
+  const selectedTable = state.selectedTableId ? state.schema.tableMap.get(state.selectedTableId) : null;
+  const hiddenTables = Math.max(0, state.schema.tables.length - state.currentTables.length);
+  const summaryItems = [
+    {
+      label: "Schema",
+      value: `${state.activeSchemas.size}/${state.schema.schemas.length}`,
+    },
+    {
+      label: "Edge",
+      value: getEdgeRenderMode() === "smart" ? "Routing chi tiết" : "Turbo",
+    },
+    {
+      label: "Đặt tay",
+      value: `${state.manualTablePositions.size} bảng`,
+    },
+    {
+      label: "Ẩn",
+      value: `${hiddenTables}`,
+    },
+  ];
+
+  if (selectedTable) {
+    summaryItems.unshift({
+      label: "Đang chọn",
+      value: `${selectedTable.schema}.${selectedTable.name}`,
+    });
+  }
+
+  elements.workspaceSummary.innerHTML = summaryItems
+    .map(
+      (item) => `
+        <span class="summary-pill">
+          <span class="summary-label">${escapeHtml(item.label)}</span>
+          <span class="summary-value">${escapeHtml(item.value)}</span>
+        </span>
+      `,
+    )
+    .join("");
 }
 
 function renderInspector() {
@@ -712,10 +809,33 @@ function renderInspector() {
   const relatedRelations = (state.schema.relationsByTable.get(table.id) || []).slice().sort((left, right) => {
     return left.name.localeCompare(right.name);
   });
+  const primaryKeys = table.columns.filter((column) => column.isPrimaryKey).map((column) => column.name);
 
   elements.inspector.innerHTML = `
     <h3 class="inspector-title">${escapeHtml(table.name)}</h3>
     <p class="inspector-meta">${escapeHtml(table.schema)} • ${table.columns.length} cột • ${table.relationCount} quan hệ</p>
+    <div class="inspector-overview">
+      <article class="inspector-stat">
+        <span class="stat-label">PK</span>
+        <strong>${table.primaryKeyCount || 0}</strong>
+      </article>
+      <article class="inspector-stat">
+        <span class="stat-label">FK</span>
+        <strong>${table.foreignKeyCount || 0}</strong>
+      </article>
+      <article class="inspector-stat">
+        <span class="stat-label">Nullable</span>
+        <strong>${table.nullableCount || 0}</strong>
+      </article>
+      <article class="inspector-stat">
+        <span class="stat-label">Default</span>
+        <strong>${table.defaultCount || 0}</strong>
+      </article>
+    </div>
+    <div class="inspector-highlight">
+      <strong>Primary key</strong>
+      <div class="detail-meta">${escapeHtml(primaryKeys.length ? primaryKeys.join(", ") : "Không có primary key.")}</div>
+    </div>
     <div class="inspector-grid">
       <section class="detail-section">
         <h3>Cột</h3>
@@ -726,8 +846,11 @@ function renderInspector() {
                 <div class="detail-item">
                   <div class="detail-name">
                     <span>${escapeHtml(column.name)}</span>
-                    ${column.isPrimaryKey ? '<span class="pill pill-pk">PK</span>' : ""}
-                    ${column.isForeignKey ? '<span class="pill pill-fk">FK</span>' : ""}
+                    <span class="detail-pill-row">
+                      ${column.isPrimaryKey ? '<span class="pill pill-pk">PK</span>' : ""}
+                      ${column.isForeignKey ? '<span class="pill pill-fk">FK</span>' : ""}
+                      ${column.nullable ? '<span class="pill pill-soft">NULL</span>' : '<span class="pill pill-neutral">NN</span>'}
+                    </span>
                   </div>
                   <div class="detail-meta">
                     ${escapeHtml(column.dataType)}
@@ -756,10 +879,17 @@ function renderInspector() {
                       ? `FK tới ${otherSide.table}`
                       : `Được ${otherSide.table} tham chiếu`;
                     const actionSummary = summarizeRelationActions(relation);
+                    const directionPill = isSource
+                      ? '<span class="pill pill-fk">OUT</span>'
+                      : '<span class="pill pill-neutral">IN</span>';
 
                     return `
                       <div class="detail-item">
-                        <div class="detail-name">${escapeHtml(directionLabel)}</div>
+                        <div class="detail-name">
+                          <span>${escapeHtml(directionLabel)}</span>
+                          ${directionPill}
+                        </div>
+                        <div class="detail-meta">${escapeHtml(relation.name)}</div>
                         <div class="detail-meta">
                           ${escapeHtml(formatCompactRelationColumns(localColumns, otherSide.table, remoteColumns))}
                         </div>
@@ -982,7 +1112,7 @@ function renderGraph() {
   elements.emptyState.innerHTML = state.schema
     ? `
         <h2>Không có bảng nào khớp bộ lọc</h2>
-        <p>Thử bật lại schema, xóa từ khóa tìm kiếm hoặc bấm <strong>Sắp xếp lại</strong> sau khi kết nối lại database.</p>
+        <p>Thử bật lại schema, xóa từ khóa tìm kiếm hoặc bấm <strong>Căn lại sơ đồ</strong> sau khi kết nối lại database.</p>
       `
     : `
         <h2>Sẵn sàng đọc schema</h2>
@@ -1029,9 +1159,9 @@ function renderNodesLayer() {
     .join("");
 }
 
-function renderEdgesLayer() {
-  const routing = buildRoutingGrid(state.currentTables, state.layout.tables);
-  elements.edges.innerHTML = state.currentRelationships.map((relation) => renderEdge(relation, routing)).join("");
+function renderEdgesLayer(mode = getEdgeRenderMode()) {
+  const routing = mode === "smart" ? buildRoutingGrid(state.currentTables, state.layout.tables) : null;
+  elements.edges.innerHTML = state.currentRelationships.map((relation) => renderEdge(relation, { mode, routing })).join("");
 }
 
 function renderCard(table, position) {
@@ -1044,13 +1174,16 @@ function renderCard(table, position) {
       (column) => `
         <div class="erd-column">
           <div class="erd-column-name">
-            <span>${escapeHtml(column.name)}</span>
+            <span class="column-name-text" title="${escapeAttribute(column.name)}">${escapeHtml(column.name)}</span>
             <span class="erd-column-flags">
               ${column.isPrimaryKey ? '<span class="pill pill-pk">PK</span>' : ""}
               ${column.isForeignKey ? '<span class="pill pill-fk">FK</span>' : ""}
+              ${column.nullable ? '<span class="pill pill-soft">NULL</span>' : '<span class="pill pill-neutral">NN</span>'}
+              ${column.isIdentity ? '<span class="pill pill-neutral">ID</span>' : ""}
+              ${column.hasDefault ? '<span class="pill pill-soft">DEF</span>' : ""}
             </span>
           </div>
-          <div class="column-meta">${escapeHtml(column.dataType)}</div>
+          <div class="column-meta" title="${escapeAttribute(column.dataType)}">${escapeHtml(column.dataType)}</div>
         </div>
       `,
     )
@@ -1060,7 +1193,7 @@ function renderCard(table, position) {
     <article
       class="erd-card ${table.id === state.selectedTableId ? "is-selected" : ""}"
       data-card-table-id="${escapeAttribute(table.id)}"
-      style="transform: translate(${position.x}px, ${position.y}px);"
+      style="transform: translate3d(${position.x}px, ${position.y}px, 0);"
     >
       <header class="erd-card-header" data-drag-handle="true" title="Kéo để di chuyển bảng">
         <div class="erd-card-title-row">
@@ -1071,13 +1204,38 @@ function renderCard(table, position) {
           <span class="schema-tag">${escapeHtml(table.schema)}</span>
           <span class="drag-label">${table.relationCount} rel • kéo</span>
         </div>
+        <div class="erd-card-stats">
+          <span class="erd-stat-pill">${table.columns.length} cột</span>
+          <span class="erd-stat-pill">${table.primaryKeyCount || 0} PK</span>
+          <span class="erd-stat-pill">${table.foreignKeyCount || 0} FK</span>
+        </div>
       </header>
       <div class="erd-card-columns">${columnsMarkup}</div>
     </article>
   `;
 }
 
-function renderEdge(relation, routing) {
+function renderEdge(relation, options = {}) {
+  const path = computeEdgePath(relation, options);
+  if (!path) {
+    return "";
+  }
+
+  const edgeClasses = getEdgeSelectionState(relation);
+  return `
+    <path
+      class="erd-edge ${edgeClasses.isActive ? "is-active" : ""} ${edgeClasses.isMuted ? "is-muted" : ""}"
+      data-edge-id="${escapeAttribute(getRelationKey(relation))}"
+      data-source-table-id="${escapeAttribute(relation.sourceTableId)}"
+      data-target-table-id="${escapeAttribute(relation.targetTableId)}"
+      d="${path}"
+    >
+      <title>${escapeHtml(`${relation.name}: ${relation.sourceTableId} -> ${relation.targetTableId}`)}</title>
+    </path>
+  `;
+}
+
+function computeEdgePath(relation, options = {}) {
   const sourcePosition = state.layout.tables.get(relation.sourceTableId);
   const targetPosition = state.layout.tables.get(relation.targetTableId);
 
@@ -1092,6 +1250,12 @@ function renderEdge(relation, routing) {
   const sourceColumnY = sourcePosition.y + CARD_HEADER_HEIGHT + sourceColumnIndex * COLUMN_HEIGHT + COLUMN_HEIGHT / 2;
   const targetColumnY = targetPosition.y + CARD_HEADER_HEIGHT + targetColumnIndex * COLUMN_HEIGHT + COLUMN_HEIGHT / 2;
   const sides = chooseEdgeSides(sourcePosition, targetPosition);
+
+  if (options.mode !== "smart") {
+    return buildFastEdgePath(sourcePosition, targetPosition, sides, sourceColumnY, targetColumnY);
+  }
+
+  const routing = options.routing || buildRoutingGrid(state.currentTables, state.layout.tables);
   const sourceEndpoint = buildEdgeEndpoint(sourcePosition, sides.source, sourceColumnY, routing);
   const targetEndpoint = buildEdgeEndpoint(targetPosition, sides.target, targetColumnY, routing);
   const freeCells = new Set([
@@ -1111,21 +1275,96 @@ function renderEdge(relation, routing) {
     targetEndpoint.bridge,
     targetEndpoint.port,
   ]);
-  const path = buildSmoothPath(points);
 
+  return buildSmoothPath(points);
+}
+
+function buildFastEdgePath(sourcePosition, targetPosition, sides, sourceColumnY, targetColumnY) {
+  const sourcePort = buildPortPoint(sourcePosition, sides.source, sourceColumnY);
+  const targetPort = buildPortPoint(targetPosition, sides.target, targetColumnY);
+  const sourceBridge = buildBridgePoint(sourcePort, sides.source, LIVE_EDGE_PORT_OFFSET);
+  const targetBridge = buildBridgePoint(targetPort, sides.target, LIVE_EDGE_PORT_OFFSET);
+  let routePoints;
+
+  if (isHorizontalSide(sides.source) && isHorizontalSide(sides.target)) {
+    const middleX = Math.round((sourceBridge.x + targetBridge.x) / 2);
+    routePoints = [
+      { x: middleX, y: sourceBridge.y },
+      { x: middleX, y: targetBridge.y },
+    ];
+  } else if (!isHorizontalSide(sides.source) && !isHorizontalSide(sides.target)) {
+    const middleY = Math.round((sourceBridge.y + targetBridge.y) / 2);
+    routePoints = [
+      { x: sourceBridge.x, y: middleY },
+      { x: targetBridge.x, y: middleY },
+    ];
+  } else {
+    routePoints = buildFallbackRoutePoints(sourceBridge, targetBridge);
+  }
+
+  const points = simplifyOrthogonalPoints([sourcePort, sourceBridge, ...routePoints, targetBridge, targetPort]);
+  return buildSmoothPath(points);
+}
+
+function buildPortPoint(position, side, preferredY) {
+  const minY = position.y + 18;
+  const maxY = position.y + position.height - 18;
+  const clampedY = clamp(preferredY, minY, maxY);
+
+  if (side === "left") {
+    return { x: position.x, y: clampedY };
+  }
+
+  if (side === "right") {
+    return { x: position.x + position.width, y: clampedY };
+  }
+
+  if (side === "top") {
+    return { x: position.x + position.width / 2, y: position.y };
+  }
+
+  return { x: position.x + position.width / 2, y: position.y + position.height };
+}
+
+function buildBridgePoint(port, side, offset) {
+  if (side === "left") {
+    return { x: port.x - offset, y: port.y };
+  }
+
+  if (side === "right") {
+    return { x: port.x + offset, y: port.y };
+  }
+
+  if (side === "top") {
+    return { x: port.x, y: port.y - offset };
+  }
+
+  return { x: port.x, y: port.y + offset };
+}
+
+function isHorizontalSide(side) {
+  return side === "left" || side === "right";
+}
+
+function getRelationKey(relation) {
+  return [
+    relation.name,
+    relation.sourceTableId,
+    relation.source.columns.join(","),
+    relation.targetTableId,
+    relation.target.columns.join(","),
+  ].join("|");
+}
+
+function getEdgeSelectionState(relation) {
   const isActive =
     state.selectedTableId &&
     (relation.sourceTableId === state.selectedTableId || relation.targetTableId === state.selectedTableId);
-  const isMuted = state.selectedTableId && !isActive;
 
-  return `
-    <path
-      class="erd-edge ${isActive ? "is-active" : ""} ${isMuted ? "is-muted" : ""}"
-      d="${path}"
-    >
-      <title>${escapeHtml(`${relation.name}: ${relation.sourceTableId} -> ${relation.targetTableId}`)}</title>
-    </path>
-  `;
+  return {
+    isActive,
+    isMuted: Boolean(state.selectedTableId && !isActive),
+  };
 }
 
 function averageColumnIndex(table, columnNames) {
@@ -1170,10 +1409,10 @@ function moveTable(tableId, x, y, deltaX = 0, deltaY = 0) {
 
   const card = findCardElement(tableId);
   if (card) {
-    card.style.transform = `translate(${resolved.x}px, ${resolved.y}px)`;
+    card.style.transform = `translate3d(${resolved.x}px, ${resolved.y}px, 0)`;
   }
 
-  scheduleDragLayoutUpdate();
+  scheduleDragLayoutUpdate(tableId);
 }
 
 function isTableSlotFree(tableId, candidate) {
@@ -1269,25 +1508,36 @@ function pushCandidateOutOfCollisions(tableId, candidate, deltaX, deltaY) {
   return null;
 }
 
-function scheduleDragLayoutUpdate() {
+function scheduleDragLayoutUpdate(tableId) {
+  state.dragFrameTableId = tableId || state.dragFrameTableId;
+
   if (state.dragFrameRequested) {
     return;
   }
 
   state.dragFrameRequested = true;
   window.requestAnimationFrame(() => {
+    const activeTableId = state.dragFrameTableId;
+
     state.dragFrameRequested = false;
-    flushDragLayout();
+    state.dragFrameTableId = null;
+    flushDragLayout(activeTableId);
   });
 }
 
-function flushDragLayout() {
+function flushDragLayout(liveTableId = null) {
   const bounds = computeLayoutBounds(state.currentTables, state.layout.tables);
   state.layout.groups = bounds.groups;
   state.layout.width = bounds.width;
   state.layout.height = bounds.height;
   applyStageMetrics();
   renderSchemaGroups();
+
+  if (liveTableId && state.drag) {
+    updateLiveEdgesForTable(liveTableId);
+    return;
+  }
+
   renderEdgesLayer();
 }
 
@@ -1677,6 +1927,17 @@ function getRoutingCellCenter(routing, col, row) {
   };
 }
 
+function getEdgeRenderMode() {
+  if (
+    state.currentRelationships.length >= FAST_EDGE_RELATION_THRESHOLD ||
+    state.currentTables.length >= FAST_EDGE_TABLE_THRESHOLD
+  ) {
+    return "fast";
+  }
+
+  return "smart";
+}
+
 function updateCardSelectionClasses() {
   const cards = elements.nodes.querySelectorAll(".erd-card");
 
@@ -1686,13 +1947,84 @@ function updateCardSelectionClasses() {
   }
 }
 
+function updateTableListSelectionClasses() {
+  const items = elements.tableList.querySelectorAll(".table-list-item");
+
+  for (const item of items) {
+    const tableId = item.getAttribute("data-table-id");
+    item.classList.toggle("is-selected", tableId === state.selectedTableId);
+  }
+}
+
+function updateEdgeSelectionClasses() {
+  const edges = elements.edges.querySelectorAll(".erd-edge");
+
+  for (const edge of edges) {
+    const sourceTableId = edge.getAttribute("data-source-table-id");
+    const targetTableId = edge.getAttribute("data-target-table-id");
+    const isActive =
+      Boolean(state.selectedTableId) &&
+      (sourceTableId === state.selectedTableId || targetTableId === state.selectedTableId);
+
+    edge.classList.toggle("is-active", isActive);
+    edge.classList.toggle("is-muted", Boolean(state.selectedTableId && !isActive));
+  }
+}
+
+function updateSelectionUI() {
+  updateCardSelectionClasses();
+  updateTableListSelectionClasses();
+  renderWorkspaceHeader();
+  renderWorkspaceSummary();
+  renderInspector();
+  updateEdgeSelectionClasses();
+}
+
 function findCardElement(tableId) {
   return elements.nodes.querySelector(`[data-card-table-id="${escapeSelectorValue(tableId)}"]`);
 }
 
+function findEdgeElement(relationKey) {
+  return elements.edges.querySelector(`[data-edge-id="${escapeSelectorValue(relationKey)}"]`);
+}
+
+function getVisibleRelationsForTable(tableId) {
+  if (!state.schema) {
+    return [];
+  }
+
+  return (state.schema.relationsByTable.get(tableId) || []).filter(
+    (relation) => state.visibleTableIds.has(relation.sourceTableId) && state.visibleTableIds.has(relation.targetTableId),
+  );
+}
+
+function updateLiveEdgesForTable(tableId) {
+  for (const relation of getVisibleRelationsForTable(tableId)) {
+    const edge = findEdgeElement(getRelationKey(relation));
+    if (!edge) {
+      continue;
+    }
+
+    const path = computeEdgePath(relation, { mode: "fast" });
+    if (path) {
+      edge.setAttribute("d", path);
+    }
+  }
+
+  updateEdgeSelectionClasses();
+}
+
 function selectTable(tableId, options) {
+  if (!state.schema) {
+    return;
+  }
+
+  const didChange = state.selectedTableId !== tableId;
   state.selectedTableId = tableId;
-  render();
+
+  if (didChange) {
+    updateSelectionUI();
+  }
 
   if (options && options.center) {
     centerTable(tableId);
@@ -1745,7 +2077,7 @@ function resetViewport() {
 }
 
 function applyViewport() {
-  elements.stage.style.transform = `translate(${state.view.x}px, ${state.view.y}px) scale(${state.view.scale})`;
+  elements.stage.style.transform = `translate3d(${state.view.x}px, ${state.view.y}px, 0) scale(${state.view.scale})`;
 }
 
 function isSchemaVisible(schemaName) {
